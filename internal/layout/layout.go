@@ -109,11 +109,16 @@ func findClientRoot(root string) string {
 	candidates := []string{
 		filepath.Join(root, "Client"),
 		filepath.Join(root, "Resources", "Client"),
+		root,
 	}
 	for _, candidate := range candidates {
-		if isDir(candidate) {
-			return candidate
+		if !isDir(candidate) {
+			continue
 		}
+		if candidate == root && !isClientModRoot(root) {
+			continue
+		}
+		return candidate
 	}
 	return ""
 }
