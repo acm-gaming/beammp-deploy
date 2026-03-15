@@ -1,8 +1,12 @@
 package deploy
 
 import (
+	"archive/zip"
 	"context"
 	"fmt"
+	"io"
+	"io/fs"
+	"os"
 	"path"
 	"path/filepath"
 	"slices"
@@ -225,21 +229,37 @@ func (d *Deployer) deployModule(ctx context.Context, client *remote.Client, serv
 	}
 
 	for _, upload := range plan.Uploads {
-		var targetRoot string
-		preserveConfig := false
+		var remoteTarget string
 		switch upload.Kind {
 		case layout.ServerKind:
-			targetRoot = roots.Server
-			preserveConfig = true
+			remoteTarget = path.Join(roots.Server, upload.RemoteDir)
+			if err := client.UploadTree(upload.LocalPath, remoteTarget, true); err != nil {
+				return false, fmt.Errorf("upload module %s to %s: %w", module.Name, remoteTarget, err)
+			}
 		case layout.ClientKind:
-			targetRoot = roots.Client
+			zipPath, err := zipDirectory(upload.LocalPath)
+			if err != nil {
+				return false, fmt.Errorf("package client module %s: %w", module.Name, err)
+			}
+			defer os.Remove(zipPath)
+
+			tmpRoot, err := os.MkdirTemp("", "beammp-client-upload-*")
+			if err != nil {
+				return false, fmt.Errorf("create temp upload dir for module %s: %w", module.Name, err)
+			}
+			defer os.RemoveAll(tmpRoot)
+
+			zipName := upload.RemoteDir + ".zip"
+			stagedZipPath := filepath.Join(tmpRoot, zipName)
+			if err := os.Rename(zipPath, stagedZipPath); err != nil {
+				return false, fmt.Errorf("stage zip for module %s: %w", module.Name, err)
+			}
+			remoteTarget = path.Join(roots.Client, zipName)
+			if err := client.UploadTree(tmpRoot, roots.Client, false); err != nil {
+				return false, fmt.Errorf("upload module %s to %s: %w", module.Name, remoteTarget, err)
+			}
 		default:
 			continue
-		}
-
-		remoteTarget := path.Join(targetRoot, upload.RemoteDir)
-		if err := client.UploadTree(upload.LocalPath, remoteTarget, preserveConfig); err != nil {
-			return false, fmt.Errorf("upload module %s to %s: %w", module.Name, remoteTarget, err)
 		}
 	}
 
@@ -309,10 +329,65 @@ func collectTargets(plan *layout.ModulePlan, roots *remote.Roots) []string {
 		case layout.ServerKind:
 			targets = append(targets, path.Join(roots.Server, upload.RemoteDir))
 		case layout.ClientKind:
-			targets = append(targets, path.Join(roots.Client, upload.RemoteDir))
+			targets = append(targets, path.Join(roots.Client, upload.RemoteDir+".zip"))
 		}
 	}
 	return targets
+}
+
+func zipDirectory(localRoot string) (string, error) {
+	zipFile, err := os.CreateTemp("", "beammp-client-mod-*.zip")
+	if err != nil {
+		return "", fmt.Errorf("create temp zip file: %w", err)
+	}
+
+	zipPath := zipFile.Name()
+	defer func() {
+		_ = zipFile.Close()
+	}()
+
+	zw := zip.NewWriter(zipFile)
+	if err := filepath.WalkDir(localRoot, func(localPath string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+
+		rel, err := filepath.Rel(localRoot, localPath)
+		if err != nil {
+			return err
+		}
+
+		archivePath := filepath.ToSlash(rel)
+		w, err := zw.Create(archivePath)
+		if err != nil {
+			return err
+		}
+
+		src, err := os.Open(localPath)
+		if err != nil {
+			return err
+		}
+		defer src.Close()
+
+		if _, err := io.Copy(w, src); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		_ = zw.Close()
+		_ = os.Remove(zipPath)
+		return "", fmt.Errorf("walk and zip %s: %w", localRoot, err)
+	}
+
+	if err := zw.Close(); err != nil {
+		_ = os.Remove(zipPath)
+		return "", fmt.Errorf("finalize zip %s: %w", zipPath, err)
+	}
+
+	return zipPath, nil
 }
 
 func cacheKey(serverName, moduleName string) string {
