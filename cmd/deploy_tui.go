@@ -97,6 +97,7 @@ type deployModel struct {
 	status    string
 	canceling bool
 	done      bool
+	finalErr  error
 
 	logs []string
 }
@@ -156,13 +157,20 @@ func (m *deployModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case deployDoneMsg:
 		m.done = true
+		m.finalErr = msg.err
 		m.canceling = false
 		if msg.err != nil {
 			m.status = "Deployment failed"
+			m.logs = append(m.logs, "ERROR: "+msg.err.Error())
+			limit := m.logLimit()
+			if len(m.logs) > limit {
+				m.logs = m.logs[len(m.logs)-limit:]
+			}
+			return m, nil
 		} else {
 			m.status = "Deployment complete"
+			return m, tea.Quit
 		}
-		return m, tea.Quit
 	}
 	return m, nil
 }
@@ -207,7 +215,7 @@ func (m *deployModel) View() string {
 		"Logs:",
 		m.renderLogs(),
 		"",
-		"Press q or ctrl+c to cancel",
+		m.footerHint(),
 	}
 
 	return strings.Join(lines, "\n")
@@ -282,6 +290,19 @@ func (m *deployModel) applyEvent(event deploy.Event) {
 		m.totalModules = event.TotalModules
 		m.status = "Saving deployment cache"
 	}
+}
+
+func (m *deployModel) footerHint() string {
+	if m.done && m.finalErr != nil {
+		return "Press q or ctrl+c to exit"
+	}
+	if m.done {
+		return "Completed"
+	}
+	if m.canceling {
+		return "Waiting for deployment to stop..."
+	}
+	return "Press q or ctrl+c to cancel"
 }
 
 func renderProgressBar(done, total, width int) string {
