@@ -1,0 +1,39 @@
+version: "3"
+
+tasks:
+  setup:
+    cmds:
+      - go mod tidy
+      - task hooks:install
+
+  run:
+    cmds:
+      - go run ./...
+
+  lint:
+    cmds:
+      - gofmt -w $(find . -name '*.go' -not -path './vendor/*')
+      - go vet ./...
+
+  test:
+    cmds:
+      - go test ./...
+
+  build:
+    cmds:
+      - mkdir -p dist
+      - GOOS=linux GOARCH=amd64 go build -o dist/beammp-deploy-linux-amd64 ./
+
+  ci:
+    cmds:
+      - task lint
+      - task test
+
+  hooks:install:
+    cmds:
+      - git config core.hooksPath .githooks
+
+  release:snapshot:
+    cmds:
+      - goreleaser release --snapshot --clean
+

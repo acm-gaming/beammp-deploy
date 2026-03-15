@@ -1,0 +1,25 @@
+# Example configuration in YAML format.
+# Note: the current CLI loads TOML config files (for example: config.toml).
+
+servers:
+  - name: my-server
+    ssh: root@192.168.1.1
+    # Optional SSH key override for this server
+    ssh_key: ~/.ssh/id_rsa
+    path: /var/lib/server/1
+    modules:
+      - name: my-mod
+        # Set exactly one source:
+        repository: https://github.com/example/my-mod
+        # local: /Users/me/dev/my-mod
+        # Optional: required if the repository has no releases
+        branch: main
+        # Optional: deploy from a subdirectory in local or repository source
+        path: subdir
+
+  - name: staging-server
+    ssh: root@192.168.1.2
+    path: /var/lib/server/staging
+    modules:
+      - name: another-mod
+        local: /Users/me/dev/another-mod

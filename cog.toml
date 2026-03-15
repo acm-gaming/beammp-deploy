@@ -1,0 +1,11 @@
+from_latest_tag = true
+ignore_merge_commits = true
+
+[commit_types]
+feat = { changelog_title = "Features" }
+fix = { changelog_title = "Bug Fixes" }
+docs = { changelog_title = "Documentation" }
+refactor = { changelog_title = "Refactors" }
+test = { changelog_title = "Tests" }
+chore = { changelog_title = "Chore" }
+
