@@ -4,3 +4,5 @@ tmp/
 coverage.out
 .env
 node_modules/
+config.*
+PLAN.md
