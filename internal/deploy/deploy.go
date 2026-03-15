@@ -24,6 +24,7 @@ type Deployer struct {
 	cfgPath           string
 	cacheStore        *cache.Store
 	githubClient      *github.Client
+	observer          Observer
 	executedServerCnt int
 }
 
@@ -49,23 +50,64 @@ func (d *Deployer) ExecutedServerCount() int {
 	return d.executedServerCnt
 }
 
+func (d *Deployer) SetObserver(observer Observer) {
+	d.observer = observer
+}
+
 func (d *Deployer) Run(ctx context.Context, serverFilter []string) error {
 	selected, err := d.selectServers(serverFilter)
 	if err != nil {
 		return err
 	}
-	d.logger.Info("starting deployment", zap.String("config", d.cfgPath), zap.Int("server_count", len(selected)))
 
+	totalModules := 0
 	for _, server := range selected {
-		if err := d.deployServer(ctx, server); err != nil {
+		totalModules += len(server.Modules)
+	}
+	d.logger.Info("starting deployment", zap.String("config", d.cfgPath), zap.Int("server_count", len(selected)))
+	d.emit(Event{
+		Type:         EventRunStarted,
+		ServerTotal:  len(selected),
+		TotalModules: totalModules,
+	})
+
+	completedModules := 0
+
+	for serverIndex, server := range selected {
+		d.emit(Event{
+			Type:             EventServerStarted,
+			Server:           server.Name,
+			ServerIndex:      serverIndex + 1,
+			ServerTotal:      len(selected),
+			CompletedModules: completedModules,
+			TotalModules:     totalModules,
+		})
+
+		if err := d.deployServer(ctx, server, serverIndex+1, len(selected), totalModules, &completedModules); err != nil {
 			return err
 		}
 		d.executedServerCnt++
+
+		d.emit(Event{
+			Type:             EventServerCompleted,
+			Server:           server.Name,
+			ServerIndex:      serverIndex + 1,
+			ServerTotal:      len(selected),
+			CompletedModules: completedModules,
+			TotalModules:     totalModules,
+		})
 	}
 
 	if err := d.cacheStore.Save(); err != nil {
 		return fmt.Errorf("save cache: %w", err)
 	}
+
+	d.emit(Event{
+		Type:             EventRunCompleted,
+		ServerTotal:      len(selected),
+		CompletedModules: completedModules,
+		TotalModules:     totalModules,
+	})
 	return nil
 }
 
@@ -91,7 +133,7 @@ func (d *Deployer) selectServers(filter []string) ([]config.Server, error) {
 	return selected, nil
 }
 
-func (d *Deployer) deployServer(ctx context.Context, server config.Server) error {
+func (d *Deployer) deployServer(ctx context.Context, server config.Server, serverIndex, serverTotal, totalModules int, completedModules *int) error {
 	d.logger.Info("connecting server", zap.String("server", server.Name), zap.String("ssh", server.SSH))
 	client, err := remote.Connect(server.SSH, server.SSHKey)
 	if err != nil {
@@ -106,37 +148,67 @@ func (d *Deployer) deployServer(ctx context.Context, server config.Server) error
 	d.logger.Debug("resolved remote roots", zap.String("server", server.Name), zap.String("server_root", roots.Server), zap.String("client_root", roots.Client))
 	claims := d.targetClaimsForServer(server.Name)
 
-	for _, module := range server.Modules {
-		if err := d.deployModule(ctx, client, server, roots, module, claims); err != nil {
+	for moduleIndex, module := range server.Modules {
+		d.emit(Event{
+			Type:              EventModuleStarted,
+			Server:            server.Name,
+			Module:            module.Name,
+			ServerIndex:       serverIndex,
+			ServerTotal:       serverTotal,
+			ServerModuleIndex: moduleIndex + 1,
+			ServerModuleTotal: len(server.Modules),
+			CompletedModules:  *completedModules,
+			TotalModules:      totalModules,
+		})
+
+		skipped, err := d.deployModule(ctx, client, server, roots, module, claims)
+		if err != nil {
 			return err
 		}
+		(*completedModules)++
+
+		evtType := EventModuleCompleted
+		if skipped {
+			evtType = EventModuleSkipped
+		}
+		d.emit(Event{
+			Type:              evtType,
+			Server:            server.Name,
+			Module:            module.Name,
+			ServerIndex:       serverIndex,
+			ServerTotal:       serverTotal,
+			ServerModuleIndex: moduleIndex + 1,
+			ServerModuleTotal: len(server.Modules),
+			CompletedModules:  *completedModules,
+			TotalModules:      totalModules,
+		})
 	}
 
 	return nil
 }
 
-func (d *Deployer) deployModule(ctx context.Context, client *remote.Client, server config.Server, roots *remote.Roots, module config.Module, claims *targetClaims) error {
+func (d *Deployer) deployModule(ctx context.Context, client *remote.Client, server config.Server, roots *remote.Roots, module config.Module, claims *targetClaims) (bool, error) {
 	key := cacheKey(server.Name, module.Name)
 	current, hasCurrent := d.cacheStore.Get(key)
 
 	resolved, err := d.githubClient.ResolveModule(ctx, module)
 	if err != nil {
-		return fmt.Errorf("resolve module %s on %s: %w", module.Name, server.Name, err)
+		return false, fmt.Errorf("resolve module %s on %s: %w", module.Name, server.Name, err)
 	}
 
 	plan, err := layout.Build(module.Name, resolved.SourcePath)
 	if err != nil {
-		return fmt.Errorf("build deploy plan for module %s on %s: %w", module.Name, server.Name, err)
+		return false, fmt.Errorf("build deploy plan for module %s on %s: %w", module.Name, server.Name, err)
 	}
 
 	newTargets := collectTargets(plan, roots)
 	if err := claims.Check(module.Name, newTargets, current.RemoteTarget); err != nil {
-		return fmt.Errorf("detect target collisions for module %s on %s: %w", module.Name, server.Name, err)
+		return false, fmt.Errorf("detect target collisions for module %s on %s: %w", module.Name, server.Name, err)
 	}
 	if hasCurrent && !d.requiresDeploy(module, current, resolved, newTargets) {
 		d.logger.Info("module unchanged; skipping", zap.String("server", server.Name), zap.String("module", module.Name))
 		claims.Update(module.Name, current.RemoteTarget, newTargets)
-		return nil
+		return true, nil
 	}
 
 	d.logger.Info("deploying module", zap.String("server", server.Name), zap.String("module", module.Name), zap.String("version", resolved.Version), zap.String("commit", resolved.Commit))
@@ -146,7 +218,7 @@ func (d *Deployer) deployModule(ctx context.Context, client *remote.Client, serv
 			if !slices.Contains(newTargets, stale) {
 				d.logger.Debug("removing stale module path", zap.String("path", stale))
 				if err := client.RemoveDirIfExists(stale); err != nil {
-					return fmt.Errorf("remove stale path %s: %w", stale, err)
+					return false, fmt.Errorf("remove stale path %s: %w", stale, err)
 				}
 			}
 		}
@@ -167,7 +239,7 @@ func (d *Deployer) deployModule(ctx context.Context, client *remote.Client, serv
 
 		remoteTarget := path.Join(targetRoot, upload.RemoteDir)
 		if err := client.UploadTree(upload.LocalPath, remoteTarget, preserveConfig); err != nil {
-			return fmt.Errorf("upload module %s to %s: %w", module.Name, remoteTarget, err)
+			return false, fmt.Errorf("upload module %s to %s: %w", module.Name, remoteTarget, err)
 		}
 	}
 
@@ -180,7 +252,15 @@ func (d *Deployer) deployModule(ctx context.Context, client *remote.Client, serv
 	})
 	claims.Update(module.Name, current.RemoteTarget, newTargets)
 
-	return nil
+	d.logger.Info("module deployed", zap.String("server", server.Name), zap.String("module", module.Name))
+	return false, nil
+}
+
+func (d *Deployer) emit(event Event) {
+	if d.observer == nil {
+		return
+	}
+	d.observer.OnDeployEvent(event)
 }
 
 func (d *Deployer) requiresDeploy(module config.Module, entry cache.Entry, resolved *github.ResolvedModule, newTargets []string) bool {
